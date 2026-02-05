@@ -3,6 +3,143 @@ import sys
 import numpy as np
 import matplotlib.pyplot as plt
 
+def wavelength_to_rgb(wavelength):
+    """
+    Approximate conversion from a wavelength in nm to an RGB tuple in [0, 1].
+    Uses the commonly-used approximation (Dan Bruton's algorithm).
+    Valid for ~380nm to 780nm. Values outside this range return (0,0,0).
+    """
+    wl = float(wavelength)
+    if wl < 380 or wl > 780:
+        return (0.0, 0.0, 0.0)
+
+    if wl >= 380 and wl < 440:
+        r = -(wl - 440) / (440 - 380)
+        g = 0.0
+        b = 1.0
+    elif wl >= 440 and wl < 490:
+        r = 0.0
+        g = (wl - 440) / (490 - 440)
+        b = 1.0
+    elif wl >= 490 and wl < 510:
+        r = 0.0
+        g = 1.0
+        b = -(wl - 510) / (510 - 490)
+    elif wl >= 510 and wl < 580:
+        r = (wl - 510) / (580 - 510)
+        g = 1.0
+        b = 0.0
+    elif wl >= 580 and wl < 645:
+        r = 1.0
+        g = -(wl - 645) / (645 - 580)
+        b = 0.0
+    else:  # 645nm - 780nm
+        r = 1.0
+        g = 0.0
+        b = 0.0
+
+    # Intensity correction near vision limits
+    if wl >= 380 and wl < 420:
+        factor = 0.3 + 0.7 * (wl - 380) / (420 - 380)
+    elif wl >= 420 and wl < 701:
+        factor = 1.0
+    elif wl >= 701 and wl <= 780:
+        factor = 0.3 + 0.7 * (780 - wl) / (780 - 700)
+    else:
+        factor = 0.0
+
+    gamma = 0.8  # a small gamma to make colors more perceptually linear here
+    def apply(gval):
+        if gval == 0.0:
+            return 0.0
+        return (gval * factor) ** gamma
+
+    return (apply(r), apply(g), apply(b))
+
+def pixels_to_wavelength_luminosity(
+    img_rgb,
+    wl_min=380,
+    wl_max=780,
+    n_wavelength_bins=70,
+    min_channel=10,
+    max_channel=245,
+):
+    """
+    1) Convert image pixels to RGB tuples (done by reshaping).
+    2) Filter out pixels where channel intensities are too low or too high
+       (these pixels can't give reliable color ratios).
+       - Default: exclude pixels with any channel < min_channel or > max_channel.
+    3) For remaining pixels, compute normalized RGB ratios and assign each pixel to
+       the wavelength (from a discretized set) whose predicted RGB-ratio best fits the pixel.
+    4) Aggregate luminosity per wavelength (sum of luminance of assigned pixels).
+    5) Return (wavelengths_array, luminosity_array)
+
+    Notes:
+    - Luminance per pixel uses the standard 0-255 weighted sum: Y = 0.299 R + 0.587 G + 0.114 B.
+    - All channel thresholds and bin counts are configurable.
+    """
+    # Flatten pixels into Nx3 (R,G,B) float array
+    pixels = img_rgb.reshape(-1, 3).astype(np.float32)  # R,G,B order
+    if pixels.size == 0:
+        return np.array([]), np.array([])
+
+    # Filter: remove pixels where any channel is too low or too high
+    mask_valid = np.all(pixels >= min_channel, axis=1) & np.all(pixels <= max_channel, axis=1)
+    valid_pixels = pixels[mask_valid]
+
+    if valid_pixels.shape[0] == 0:
+        # No valid pixels -> return wavelengths and zero luminosity
+        wavelengths = np.linspace(wl_min, wl_max, n_wavelength_bins)
+        return wavelengths, np.zeros_like(wavelengths)
+
+    # Compute normalized color ratio (sum to 1) for matching; avoid divid by zero
+    sums = valid_pixels.sum(axis=1, keepdims=True)
+    # Exclude degenerate pixels with very low sum (should not happen due to min_channel)
+    nonzero_mask = (sums[:, 0] > 0)
+    valid_pixels = valid_pixels[nonzero_mask]
+    sums = sums[nonzero_mask]
+
+    ratios = valid_pixels / sums  # each row now [r/(r+g+b), g/(r+g+b), b/(r+g+b)]
+
+    # Precompute model RGB ratios for each wavelength bin
+    wavelengths = np.linspace(wl_min, wl_max, n_wavelength_bins)
+    model_rgbs = np.array([wavelength_to_rgb(wl) for wl in wavelengths], dtype=np.float32)  # shape (M,3)
+
+    # Normalize model RGBs to ratios (sum to 1). If a model is zero (out-of-range), replace with tiny epsilon.
+    model_sums = model_rgbs.sum(axis=1, keepdims=True)
+    model_sums[model_sums == 0] = 1e-9
+    model_ratios = model_rgbs / model_sums  # shape (M,3)
+
+    # For each pixel, find the model wavelength index with smallest squared error to pixel ratio
+    # Vectorized distance: for N pixels, M models -> compute (N, M) distances
+    # To avoid giant memory for very large N, we process in chunks
+    N = ratios.shape[0]
+    M = model_ratios.shape[0]
+    chunk_size = 200000  # tuneable
+    assigned_indices = np.empty(N, dtype=np.int32)
+
+    for start in range(0, N, chunk_size):
+        end = min(N, start + chunk_size)
+        chunk = ratios[start:end]  # (C,3)
+        # compute squared distances to all model ratios -> (C, M)
+        # using broadcasting efficiently
+        diff = chunk[:, None, :] - model_ratios[None, :, :]  # (C,M,3)
+        d2 = np.sum(diff * diff, axis=2)  # (C,M)
+        assigned_indices[start:end] = np.argmin(d2, axis=1)
+
+    # Compute luminance for valid (and non-degenerate) pixels using standard formula
+    # Use original channel scale (0-255)
+    # valid_pixels corresponds exactly to assigned_indices
+    luminance = 0.299 * valid_pixels[:, 0] + 0.587 * valid_pixels[:, 1] + 0.114 * valid_pixels[:, 2]
+
+    # Aggregate luminosity per wavelength bin
+    luminosity_per_bin = np.bincount(assigned_indices, weights=luminance, minlength=M)
+    # Ensure shape is (M,)
+    if luminosity_per_bin.shape[0] < M:
+        luminosity_per_bin = np.pad(luminosity_per_bin, (0, M - luminosity_per_bin.shape[0]))
+
+    return wavelengths, luminosity_per_bin
+
 def analyze_light_frequency(image_path):
     # 1. Load the image
     # Note: OpenCV loads as BGR by default
@@ -59,7 +196,7 @@ def analyze_light_frequency(image_path):
     )
 
     ax1 = fig.add_subplot(gs[0, :])    # top row spanning both columns
-    ax2 = fig.add_subplot(gs[1, 0])    # bottom-left: spectral distribution
+    ax2 = fig.add_subplot(gs[1, 0])    # bottom-left: spectral distribution (replaced with line chart)
     ax3 = fig.add_subplot(gs[1, 1])    # bottom-right: thumbnail
 
     # 2. Define Approximate Sensor Peaks (Wavelengths in nm)
@@ -79,29 +216,34 @@ def analyze_light_frequency(image_path):
     ax1.set_ylabel('Number of Pixels')
     ax1.legend()
 
-    # 4. Estimated Spectral Energy Distribution (plot on ax2)
-    channel_totals = [np.sum(img_rgb[:, :, 0]), np.sum(img_rgb[:, :, 1]), np.sum(img_rgb[:, :, 2])]
-    wavelengths = [peaks['Red'], peaks['Green'], peaks['Blue']]
+    # 4. Estimated Spectral Energy Distribution -> replaced with wavelength vs luminosity line chart
+    # Use 70 ranges by default as requested
+    wavelengths, luminosities = pixels_to_wavelength_luminosity(
+        img_rgb,
+        wl_min=380,
+        wl_max=780,
+        n_wavelength_bins=70,
+        min_channel=10,
+        max_channel=245,
+    )
 
-    sorted_data = sorted(zip(wavelengths, channel_totals, ['red', 'green', 'blue']))
-    w_vals, i_vals, c_vals = zip(*sorted_data)
-
-    ax2.bar(w_vals, i_vals, width=30, color=c_vals, alpha=0.6, edgecolor='black')
-    ax2.set_title('Estimated Spectral Energy Distribution')
-    ax2.set_xlabel('Approximate Wavelength (nm)')
-    ax2.set_ylabel('Total Accumulated Intensity')
-    ax2.set_xticks([450, 530, 650])
-    ax2.set_xticklabels(['450nm (Blue)', '530nm (Green)', '650nm (Red)'])
+    # Plot line chart: wavelength (x) vs luminosity (y)
+    if wavelengths.size > 0:
+        ax2.plot(wavelengths, luminosities, color='purple', linewidth=1.5)
+        ax2.fill_between(wavelengths, luminosities, color='purple', alpha=0.2)
+        ax2.set_title('Estimated Spectral Luminosity (Wavelength vs Luminosity)')
+        ax2.set_xlabel('Wavelength (nm)')
+        ax2.set_ylabel('Aggregated Luminance (sum)')
+        ax2.grid(True, linestyle='--', alpha=0.4)
+    else:
+        ax2.text(0.5, 0.5, 'No valid pixels for wavelength estimation', ha='center', va='center')
+        ax2.set_title('Estimated Spectral Luminosity (no data)')
+        ax2.set_xlabel('Wavelength (nm)')
+        ax2.set_ylabel('Aggregated Luminance (sum)')
 
     # 5. Thumbnail on the right of the second chart
-    # Show the image while preserving aspect ratio. The GridSpec allocation ensures
-    # the thumbnail area is no less than 1/5 and no more than 1/2 of the bottom-row width,
-    # and we computed the fraction so that the image can fill that space as large as possible.
     ax3.imshow(img_rgb)
     ax3.axis('off')  # hide ticks/labels so the thumbnail is clean
-
-    # Optional: annotate the chosen fraction (helpful for debugging or UI feedback)
-    # ax3.set_title(f'Thumbnail ({thumbnail_frac*100:.0f}% width)')
 
     plt.tight_layout()
     # Set window title if backend supports it (safe-guarded)
