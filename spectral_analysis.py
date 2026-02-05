@@ -225,13 +225,16 @@ def analyze_light_frequency(image_path):
 
     # 4. Estimated Spectral Energy Distribution -> replaced with wavelength vs luminosity line chart
     # Use 70 ranges by default as requested
+    # Use same thresholds here to later mask filtered pixels in the thumbnail
+    min_channel = 10
+    max_channel = 245
     wavelengths, luminosities = pixels_to_wavelength_luminosity(
         img_rgb,
         wl_min=380,
         wl_max=780,
         n_wavelength_bins=70,
-        min_channel=10,
-        max_channel=245,
+        min_channel=min_channel,
+        max_channel=max_channel,
     )
 
     # small positive floor to avoid log(0) on luminosity plot
@@ -255,10 +258,25 @@ def analyze_light_frequency(image_path):
         ax2.set_ylabel('Aggregated Luminance (sum)')
 
     # 5. Thumbnail on the right of the second chart
-    ax3.imshow(img_rgb)
+    # Mask all filtered pixels (those excluded by min_channel/max_channel) with the canvas background color
+    # Flatten original pixels and compute same mask used by pixels_to_wavelength_luminosity
+    pixels_flat = img_rgb.reshape(-1, 3)
+    mask_valid = np.all(pixels_flat >= min_channel, axis=1) & np.all(pixels_flat <= max_channel, axis=1)
+    mask_valid_2d = mask_valid.reshape(img_h, img_w)
+
+    # Create a copy for the thumbnail and fill masked-out pixels with the axes facecolor
+    thumbnail_img = img_rgb.copy()
+
+    # Get axes facecolor (RGBA in 0-1 floats), convert to 0-255 uint8 RGB
+    facecolor = ax3.get_facecolor()  # (r, g, b, a) in 0-1 range
+    bg_rgb = np.round(np.array(facecolor[:3]) * 255.0).astype(np.uint8)
+
+    # Apply background color to filtered pixels
+    thumbnail_img[~mask_valid_2d] = bg_rgb
+
+    ax3.imshow(thumbnail_img)
     ax3.axis('off')  # hide ticks/labels so the thumbnail is clean
 
-    plt.tight_layout()
     # Set window title if backend supports it (safe-guarded)
     try:
         plt.get_current_fig_manager().set_window_title(f"{image_path}: Histograms + Image")
