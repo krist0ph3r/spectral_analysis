@@ -57,12 +57,12 @@ def wavelength_to_rgb(wavelength):
     return (apply(r), apply(g), apply(b))
 
 def pixels_to_wavelength_luminosity(
-    img_rgb,
-    wl_min=380,
-    wl_max=780,
-    n_wavelength_bins=70,
-    min_channel=10,
-    max_channel=245,
+        img_rgb,
+        wl_min=380,
+        wl_max=780,
+        n_wavelength_bins=70,
+        min_channel=10,
+        max_channel=245,
 ):
     """
     1) Convert image pixels to RGB tuples (done by reshaping).
@@ -207,13 +207,20 @@ def analyze_light_frequency(image_path):
     colors = ('r', 'g', 'b')
     channel_names = ('Red', 'Green', 'Blue')
 
+    # small positive floor to avoid log(0)
+    eps_hist = 1e-1
+
     for i, col in enumerate(colors):
-        hist = cv2.calcHist([img_rgb], [i], None, [256], [0, 256])
-        ax1.plot(hist, color=col, label=f'{channel_names[i]} Channel')
+        hist = cv2.calcHist([img_rgb], [i], None, [256], [0, 256]).flatten()
+        # replace non-positive values with epsilon so log-scale can be used safely
+        hist_safe = hist.copy()
+        hist_safe[hist_safe <= 0] = eps_hist
+        ax1.plot(hist_safe, color=col, label=f'{channel_names[i]} Channel')
 
     ax1.set_title('Pixel Intensity Distribution (Luminance)')
     ax1.set_xlabel('Brightness (0-255)')
-    ax1.set_ylabel('Number of Pixels')
+    ax1.set_ylabel('Number of Pixels (log scale)')
+    ax1.set_yscale('log')
     ax1.legend()
 
     # 4. Estimated Spectral Energy Distribution -> replaced with wavelength vs luminosity line chart
@@ -227,13 +234,19 @@ def analyze_light_frequency(image_path):
         max_channel=245,
     )
 
+    # small positive floor to avoid log(0) on luminosity plot
+    eps_lum = 1e-3
+
     # Plot line chart: wavelength (x) vs luminosity (y)
     if wavelengths.size > 0:
-        ax2.plot(wavelengths, luminosities, color='purple', linewidth=1.5)
-        ax2.fill_between(wavelengths, luminosities, color='purple', alpha=0.2)
+        lum_safe = luminosities.copy()
+        lum_safe[lum_safe <= 0] = eps_lum
+        ax2.plot(wavelengths, lum_safe, color='purple', linewidth=1.5)
+        ax2.fill_between(wavelengths, lum_safe, color='purple', alpha=0.2)
         ax2.set_title('Estimated Spectral Luminosity (Wavelength vs Luminosity)')
         ax2.set_xlabel('Wavelength (nm)')
-        ax2.set_ylabel('Aggregated Luminance (sum)')
+        ax2.set_ylabel('Aggregated Luminance (sum, log scale)')
+        ax2.set_yscale('log')
         ax2.grid(True, linestyle='--', alpha=0.4)
     else:
         ax2.text(0.5, 0.5, 'No valid pixels for wavelength estimation', ha='center', va='center')
